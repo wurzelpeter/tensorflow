@@ -37,6 +37,7 @@ from tensorflow.python.distribute import values
 from tensorflow.python.distribute.cluster_resolver import TPUClusterResolver
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
+from tensorflow.python.eager import function
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import device_spec
 from tensorflow.python.framework import dtypes
@@ -82,6 +83,31 @@ def maybe_init_scope():
       yield
 
 
+def validate_experimental_run_function(fn):
+  """Validate the function passed into strategy.experimental_run_v2."""
+
+  # We allow three types of functions/objects passed into TPUStrategy
+  # experimental_run_v2 in eager mode:
+  #   1. a user annotated tf.function
+  #   2. a ConcreteFunction, this is mostly what you get from loading a saved
+  #      model.
+  #   3. a callable object and the `__call__` method itself is a tf.function.
+  #
+  # Otherwise we return an error, because we don't support eagerly running
+  # experimental_run_v2 in TPUStrategy.
+
+  if context.executing_eagerly() and not isinstance(
+      fn, def_function.Function) and not isinstance(
+          fn, function.ConcreteFunction) and not (callable(fn) and isinstance(
+              fn.__call__, def_function.Function)):
+    raise NotImplementedError(
+        "TPUStrategy.experimental_run_v2(fn, ...) does not support pure eager "
+        "execution. please make sure the function passed into "
+        "`strategy.experimental_run_v2` is a `tf.function` or "
+        "`strategy.experimental_run_v2` is called inside a `tf.function` if "
+        "eager behavior is enabled.")
+
+
 @tf_export("distribute.experimental.TPUStrategy", v1=[])
 class TPUStrategy(distribute_lib.Strategy):
   """TPU distribution strategy implementation."""
@@ -89,14 +115,36 @@ class TPUStrategy(distribute_lib.Strategy):
   def __init__(self,
                tpu_cluster_resolver=None,
                device_assignment=None):
-    """Initializes the TPUStrategy object.
+    """Synchronous training in TPU donuts or Pods.
+
+    To construct a TPUStrategy object, you need to run the
+    initialization code as below:
+
+    ```python
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=FLAGS.tpu)
+    tf.config.experimental_connect_to_cluster(resolver)
+    tf.tpu.experimental.initialize_tpu_system(resolver)
+    strategy = tf.distribute.experimental.TPUStrategy(resolver)
+    ```
+
+    While using distribution strategies, the variables created within strategy's
+    scope will be replicated across all the replicas and can be kept in sync
+    using all-reduce algorithms.
+
+    To run TF2 programs on TPUs, you can either use `.compile` and
+    `.fit` APIs in `tf.keras` with TPUStrategy, or write your own customized
+    training loop by calling `strategy.experimental_run_v2` directly. Note that
+    TPUStrategy doesn't support pure eager execution, so please make sure the
+    function passed into `strategy.experimental_run_v2` is a `tf.function` or
+    `strategy.experimental_run_v2` is called inside a `tf.function` if eager
+    behavior is enabled.
 
     Args:
       tpu_cluster_resolver: A tf.distribute.cluster_resolver.TPUClusterResolver,
-          which provides information about the TPU cluster.
+        which provides information about the TPU cluster.
       device_assignment: Optional `tf.tpu.experimental.DeviceAssignment` to
-          specify the placement of replicas on the TPU cluster. Currently only
-          supports the usecase of using a single core within a TPU cluster.
+        specify the placement of replicas on the TPU cluster. Currently only
+        supports the usecase of using a single core within a TPU cluster.
     """
     super(TPUStrategy, self).__init__(TPUExtended(
         self, tpu_cluster_resolver, device_assignment=device_assignment))
@@ -111,6 +159,8 @@ class TPUStrategy(distribute_lib.Strategy):
   # This implementation runs a single step. It does not use infeed or outfeed.
   def experimental_run_v2(self, fn, args=(), kwargs=None):
     """See base class."""
+    validate_experimental_run_function(fn)
+
     # Note: the target function is converted to graph even when in Eager mode,
     # so autograph is on by default here.
     fn = autograph.tf_convert(fn, ag_ctx.control_status_ctx())
@@ -157,6 +207,8 @@ class TPUStrategyV1(distribute_lib.StrategyV1):
   # This implementation runs a single step. It does not use infeed or outfeed.
   def experimental_run_v2(self, fn, args=(), kwargs=None):
     """See base class."""
+    validate_experimental_run_function(fn)
+
     fn = autograph.tf_convert(fn, ag_ctx.control_status_ctx())
     return self.extended.tpu_run(fn, args, kwargs)
 
@@ -201,16 +253,14 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
 
     self._host_device = device_util.get_host_for_device(self._tpu_devices[0])
 
-    self._device_map = values.ReplicaDeviceMap(self._tpu_devices)
-
     # Preload the data onto the TPUs.
     input_worker_devices = collections.OrderedDict()
     for tpu_device in self._tpu_devices:
       host_device = device_util.get_host_for_device(tpu_device)
       input_worker_devices.setdefault(host_device, [])
       input_worker_devices[host_device].append(tpu_device)
-    self._input_workers = input_lib.InputWorkers(
-        self._device_map, tuple(input_worker_devices.items()))
+    self._input_worker_devices = tuple(input_worker_devices.items())
+    self._input_workers_obj = None
 
     # TODO(sourabhbajaj): Remove this once performance of running one step
     # at a time is comparable to multiple steps.
@@ -223,6 +273,39 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
 
     self.experimental_enable_get_next_as_optional = True
     self.experimental_enable_dynamic_batch_size = True
+    self._prefetch_on_host = False
+
+  # TODO(bfontain): Remove once a proper dataset API exists for prefetching
+  # a dataset to multiple devices exists.
+  # If value is true, this forces prefetch of data to the host's memeory rather
+  # than the individual TPU device's memory. This is needed when using for TPU
+  # Embeddings as a) sparse tensors cannot be prefetched to the TPU device
+  # memory and b) TPU Embedding enqueue operation are CPU ops and this avoids
+  # a copy back to the host for dense tensors
+  def _set_prefetch_on_host(self, value):
+    if self._prefetch_on_host == value:
+      return
+    if self._input_workers_obj is not None:
+      raise RuntimeError("Unable to change prefetch on host behavior as "
+                         "InputWorkers are already created.")
+    self._prefetch_on_host = value
+    if value:
+      # To prefetch on the host, we must set all the input worker devices to the
+      # corresponding host devices.
+      self._input_worker_devices = tuple([
+          tuple([host,
+                 [device_util.get_host_for_device(d) for d in devices]])
+          for host, devices in self._input_worker_devices])
+      # Force creation of the workers.
+      workers = self._input_workers
+      del workers
+
+  @property
+  def _input_workers(self):
+    if self._input_workers_obj is None:
+      self._input_workers_obj = input_lib.InputWorkers(
+          self._input_worker_devices)
+    return self._input_workers_obj
 
   def _validate_colocate_with_variable(self, colocate_with_variable):
     values.validate_colocate(colocate_with_variable, self)
@@ -395,16 +478,14 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
 
     colocate_with = kwargs.pop("colocate_with", None)
     if colocate_with is None:
-      device_map = self._device_map
-      logical_device = 0  # TODO(josh11b): Get logical device from scope here.
+      devices = self._tpu_devices
     elif isinstance(colocate_with, numpy_dataset.SingleDevice):
       with ops.device(colocate_with.device):
         return next_creator(*args, **kwargs)
     else:
-      device_map = colocate_with.device_map
-      logical_device = colocate_with.logical_device
+      devices = colocate_with.devices
 
-    def _real_mirrored_creator(devices, *args, **kwargs):  # pylint: disable=g-missing-docstring
+    def _real_mirrored_creator(*args, **kwargs):  # pylint: disable=g-missing-docstring
       initial_value = None
       value_list = []
       for i, d in enumerate(devices):
@@ -434,9 +515,9 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
       return value_list
 
     return values.create_mirrored_variable(
-        self._container_strategy(), device_map, logical_device,
-        _real_mirrored_creator, values.TPUMirroredVariable,
-        values.TPUSyncOnReadVariable, *args, **kwargs)
+        self._container_strategy(), _real_mirrored_creator,
+        values.TPUMirroredVariable, values.TPUSyncOnReadVariable,
+        *args, **kwargs)
 
   def _reduce_to(self, reduce_op, value, destinations):
     if values._enclosing_tpu_context() is not None:  # pylint: disable=protected-access
@@ -454,7 +535,7 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
       # replicas in which case `value` would be a single value or value could
       # be 0.
       return cross_device_ops_lib.reduce_non_distributed_value(
-          reduce_op, self._device_map, value, destinations)
+          reduce_op, value, destinations, self._num_replicas_in_sync)
 
     # TODO(cjfj): Detect when it is possible to use `cross_replica_sum`.
     # Always performs the reduction on the TPU host.
@@ -490,14 +571,16 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
     # Otherwise, we revert to MirroredStrategy behavior and update each variable
     # directly.
     updates = []
-    for i, (d, v) in enumerate(zip(var.devices, var.values)):
+    for i, v in enumerate(var.values):
       name = "update_%d" % i
-      with ops.device(d), distribute_lib.UpdateContext(i), ops.name_scope(name):
+      with ops.device(v.device), \
+           distribute_lib.UpdateContext(i), \
+           ops.name_scope(name):
         # If args and kwargs are not mirrored, the value is returned as is.
         updates.append(fn(v,
-                          *values.select_device_mirrored(d, args),
-                          **values.select_device_mirrored(d, kwargs)))
-    return values.update_regroup(self, self._device_map, updates, group)
+                          *values.select_replica_mirrored(i, args),
+                          **values.select_replica_mirrored(i, kwargs)))
+    return values.update_regroup(self, updates, group)
 
   def read_var(self, var):
     assert isinstance(var, values.TPUVariableMixin) or isinstance(
@@ -699,15 +782,14 @@ class TPUExtended(distribute_lib.StrategyExtendedV1):
         ]
 
       # Workaround for `tpu.replicate` behaviour when single `Tensor` returned.
-      if result[0] is None:
+      if result[0] is None or isinstance(result[0], ops.Operation):
         replicate_outputs = [None] * len(replicate_outputs)
       else:
         replicate_outputs = [
             nest.pack_sequence_as(result[0], nest.flatten(replica_output))
             for replica_output in replicate_outputs
         ]
-      device_map = self._device_map  # pylint: disable=protected-access
-      return values.regroup(device_map, replicate_outputs)
+      return values.regroup(replicate_outputs)
 
     if context.executing_eagerly():
       tpu_function = def_function.function(tpu_function)

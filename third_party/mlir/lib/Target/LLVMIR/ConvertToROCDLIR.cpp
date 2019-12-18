@@ -31,6 +31,7 @@
 #include "mlir/Translation.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/ToolOutputFile.h"
 
@@ -69,7 +70,7 @@ static llvm::Value *createDeviceFunctionCall(llvm::IRBuilder<> &builder,
 class ModuleTranslation : public LLVM::ModuleTranslation {
 
 public:
-  explicit ModuleTranslation(ModuleOp module)
+  explicit ModuleTranslation(Operation *module)
       : LLVM::ModuleTranslation(module) {}
   ~ModuleTranslation() override {}
 
@@ -84,7 +85,7 @@ protected:
 };
 } // namespace
 
-std::unique_ptr<llvm::Module> mlir::translateModuleToROCDLIR(ModuleOp m) {
+std::unique_ptr<llvm::Module> mlir::translateModuleToROCDLIR(Operation *m) {
   ModuleTranslation translation(m);
 
   // lower MLIR (with RODL Dialect) to LLVM IR (with ROCDL intrinsics)
@@ -94,7 +95,8 @@ std::unique_ptr<llvm::Module> mlir::translateModuleToROCDLIR(ModuleOp m) {
   // foreach GPU kernel
   // 1. Insert AMDGPU_KERNEL calling convention.
   // 2. Insert amdgpu-flat-workgroup-size(1, 1024) attribute.
-  for (auto func : m.getOps<LLVM::LLVMFuncOp>()) {
+  for (auto func :
+       ModuleTranslation::getModuleBody(m).getOps<LLVM::LLVMFuncOp>()) {
     if (!func.getAttrOfType<UnitAttr>(gpu::GPUDialect::getKernelFuncAttrName()))
       continue;
 

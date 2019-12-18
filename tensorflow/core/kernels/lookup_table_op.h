@@ -41,9 +41,15 @@ class LookupTableOp : public OpKernel {
   // ctx is not owned by this class.
   explicit LookupTableOp(OpKernelConstruction* ctx)
       : OpKernel(ctx), table_handle_set_(false) {
-    OP_REQUIRES_OK(ctx, ctx->allocate_persistent(tensorflow::DT_STRING,
-                                                 tensorflow::TensorShape({2}),
-                                                 &table_handle_, nullptr));
+    if (ctx->output_type(0) == DT_RESOURCE) {
+      OP_REQUIRES_OK(ctx, ctx->allocate_persistent(tensorflow::DT_RESOURCE,
+                                                   tensorflow::TensorShape({}),
+                                                   &table_handle_, nullptr));
+    } else {
+      OP_REQUIRES_OK(ctx, ctx->allocate_persistent(tensorflow::DT_STRING,
+                                                   tensorflow::TensorShape({2}),
+                                                   &table_handle_, nullptr));
+    }
     OP_REQUIRES_OK(
         ctx, ctx->GetAttr("use_node_name_sharing", &use_node_name_sharing_));
   }
@@ -85,11 +91,13 @@ class LookupTableOp : public OpKernel {
                             DataTypeToEnum<value_dtype>::v(), cinfo_.name()));
 
     if (ctx->expected_output_dtype(0) == DT_RESOURCE) {
-      Tensor* handle;
-      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &handle));
-      handle->scalar<ResourceHandle>()() =
-          MakeResourceHandle<lookup::LookupInterface>(ctx, cinfo_.container(),
-                                                      cinfo_.name());
+      if (!table_handle_set_) {
+        auto h =
+            table_handle_.AccessTensor(ctx)->template scalar<ResourceHandle>();
+        h() = MakeResourceHandle<lookup::LookupInterface>(
+            ctx, cinfo_.container(), cinfo_.name());
+      }
+      ctx->set_output(0, *table_handle_.AccessTensor(ctx));
     } else {
       if (!table_handle_set_) {
         auto h = table_handle_.AccessTensor(ctx)->template flat<tstring>();
@@ -180,15 +188,14 @@ class HashTable : public InitializableLookupTable {
 
   size_t size() const override {
     // return the size of the table only if it's initialized, otherwise 0.
-    if (!is_initialized_) {
+    if (!is_initialized()) {
       return 0;
     }
-    std::atomic_thread_fence(std::memory_order_acquire);
     return table_ ? table_->size() : 0;
   }
 
   Status ExportValues(OpKernelContext* context) override {
-    if (!is_initialized_) {
+    if (!is_initialized()) {
       return errors::Aborted("HashTable is not initialized.");
     }
 
@@ -217,7 +224,7 @@ class HashTable : public InitializableLookupTable {
 
  protected:
   Status DoPrepare(size_t unused) override {
-    if (is_initialized_) {
+    if (is_initialized()) {
       return errors::Aborted("HashTable already initialized.");
     }
     if (!table_) {
@@ -266,6 +273,9 @@ class HashTable : public InitializableLookupTable {
   }
 
   int64 MemoryUsed() const override {
+    if (!is_initialized()) {
+      return 0;
+    }
     if (table_) {
       const int64 num_elements = table_->size();
       return num_elements * (sizeof(K) + sizeof(V));

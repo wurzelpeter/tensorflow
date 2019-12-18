@@ -3,6 +3,10 @@ load(
     "tflite_cc_shared_object",
     "tflite_copts",
 )
+load(
+    "//tensorflow/lite/micro:build_def.bzl",
+    "cc_library",
+)
 
 package(
     default_visibility = [":experimental"],
@@ -130,6 +134,7 @@ cc_library(
         "builtin_op_data.h",
         "common.h",
     ],
+    build_for_embedded = True,
     visibility = [
         "//tensorflow/lite:__subpackages__",
     ],
@@ -137,7 +142,10 @@ cc_library(
 )
 
 # For use with library targets that can't use relative paths.
-exports_files(["common.h"])
+exports_files([
+    "c_api.h",
+    "common.h",
+])
 
 # Test the C extension API code.
 cc_test(

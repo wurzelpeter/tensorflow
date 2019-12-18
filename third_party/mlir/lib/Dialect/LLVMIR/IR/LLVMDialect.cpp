@@ -177,9 +177,8 @@ static void printGEPOp(OpAsmPrinter &p, GEPOp &op) {
   SmallVector<Type, 8> types(op.getOperandTypes());
   auto funcTy = FunctionType::get(types, op.getType(), op.getContext());
 
-  p << op.getOperationName() << ' ' << *op.base() << '[';
-  p.printOperands(std::next(op.operand_begin()), op.operand_end());
-  p << ']';
+  p << op.getOperationName() << ' ' << *op.base() << '['
+    << op.getOperands().drop_front() << ']';
   p.printOptionalAttrDict(op.getAttrs());
   p << " : " << funcTy;
 }
@@ -312,10 +311,7 @@ static void printCallOp(OpAsmPrinter &p, CallOp &op) {
   else
     p << *op.getOperand(0);
 
-  p << '(';
-  p.printOperands(llvm::drop_begin(op.getOperands(), isDirect ? 0 : 1));
-  p << ')';
-
+  p << '(' << op.getOperands().drop_front(isDirect ? 0 : 1) << ')';
   p.printOptionalAttrDict(op.getAttrs(), {"callee"});
 
   // Reconstruct the function MLIR function type from operand and result types.
@@ -794,9 +790,12 @@ static ParseResult parseUndefOp(OpAsmParser &parser, OperationState &result) {
 //===----------------------------------------------------------------------===//
 
 GlobalOp AddressOfOp::getGlobal() {
-  auto module = getParentOfType<ModuleOp>();
+  Operation *module = getParentOp();
+  while (module && !satisfiesLLVMModule(module))
+    module = module->getParentOp();
   assert(module && "unexpected operation outside of a module");
-  return module.lookupSymbol<LLVM::GlobalOp>(global_name());
+  return dyn_cast_or_null<LLVM::GlobalOp>(
+      mlir::SymbolTable::lookupSymbolIn(module, global_name()));
 }
 
 static void printAddressOfOp(OpAsmPrinter &p, AddressOfOp op) {
@@ -825,7 +824,8 @@ static LogicalResult verify(AddressOfOp op) {
     return op.emitOpError(
         "must reference a global defined by 'llvm.mlir.global'");
 
-  if (global.getType().getPointerTo() != op.getResult()->getType())
+  if (global.getType().getPointerTo(global.addr_space().getZExtValue()) !=
+      op.getResult()->getType())
     return op.emitOpError(
         "the type must be a pointer to the type of the referred global");
 
@@ -868,7 +868,8 @@ static StringRef getLinkageAttrName() { return "linkage"; }
 
 void GlobalOp::build(Builder *builder, OperationState &result, LLVMType type,
                      bool isConstant, Linkage linkage, StringRef name,
-                     Attribute value, ArrayRef<NamedAttribute> attrs) {
+                     Attribute value, unsigned addrSpace,
+                     ArrayRef<NamedAttribute> attrs) {
   result.addAttribute(SymbolTable::getSymbolAttrName(),
                       builder->getStringAttr(name));
   result.addAttribute("type", TypeAttr::get(type));
@@ -878,6 +879,8 @@ void GlobalOp::build(Builder *builder, OperationState &result, LLVMType type,
     result.addAttribute("value", value);
   result.addAttribute(getLinkageAttrName(), builder->getI64IntegerAttr(
                                                 static_cast<int64_t>(linkage)));
+  if (addrSpace != 0)
+    result.addAttribute("addr_space", builder->getI32IntegerAttr(addrSpace));
   result.attributes.append(attrs.begin(), attrs.end());
   result.addRegion();
 }
@@ -934,8 +937,7 @@ static void printGlobalOp(OpAsmPrinter &p, GlobalOp op) {
   // Print the trailing type unless it's a string global.
   if (op.getValueOrNull().dyn_cast_or_null<StringAttr>())
     return;
-  p << " : ";
-  p.printType(op.type());
+  p << " : " << op.type();
 
   Region &initializer = op.getInitializerRegion();
   if (!initializer.empty())
@@ -1031,7 +1033,7 @@ static LogicalResult verify(GlobalOp op) {
   if (!llvm::PointerType::isValidElementType(op.getType().getUnderlyingType()))
     return op.emitOpError(
         "expects type to be a valid element type for an LLVM pointer");
-  if (op.getParentOp() && !isa<ModuleOp>(op.getParentOp()))
+  if (op.getParentOp() && !satisfiesLLVMModule(op.getParentOp()))
     return op.emitOpError("must appear at the module level");
 
   if (auto strAttr = op.getValueOrNull().dyn_cast_or_null<StringAttr>()) {
@@ -1342,8 +1344,7 @@ static LogicalResult verify(LLVMFuncOp op) {
 static void printNullOp(OpAsmPrinter &p, LLVM::NullOp op) {
   p << NullOp::getOperationName();
   p.printOptionalAttrDict(op.getAttrs());
-  p << " : ";
-  p.printType(op.getType());
+  p << " : " << op.getType();
 }
 
 // <operation> = `llvm.mlir.null` : type
@@ -1676,4 +1677,9 @@ Value *mlir::LLVM::createGlobalString(Location loc, OpBuilder &builder,
   return builder.create<LLVM::GEPOp>(
       loc, LLVM::LLVMType::getInt8PtrTy(llvmDialect), globalPtr,
       ArrayRef<Value *>({cst0, cst0}));
+}
+
+bool mlir::LLVM::satisfiesLLVMModule(Operation *op) {
+  return op->hasTrait<OpTrait::SymbolTable>() &&
+         op->hasTrait<OpTrait::IsIsolatedFromAbove>();
 }

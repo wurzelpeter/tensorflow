@@ -21,7 +21,7 @@ load("//tensorflow:tensorflow.bzl", "if_nccl")
 load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_test")
 load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_tests")
 load(
-    "//tensorflow/core/platform:default/cuda_build_defs.bzl",
+    "//tensorflow/core/platform/default:cuda_build_defs.bzl",
     "if_cuda_is_configured",
 )
 load(
@@ -65,7 +65,7 @@ package_group(
     name = "friends",
     packages = [
         "//learning/brain/contrib/...",
-        "//learning/brain/research/sparse_matrix/...",
+        "//learning/brain/research/...",
         "//learning/faster_training/...",
         "//tensorflow/...",
         "//tensorflow_text/...",
@@ -1097,8 +1097,8 @@ tf_cc_test(
     name = "fingerprint_op_test",
     size = "small",
     srcs = ["fingerprint_op_test.cc"],
-    kernels = [":fingerprint_op"],
     deps = [
+        ":fingerprint_op",
         ":ops_testutil",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
@@ -1536,7 +1536,6 @@ tf_kernel_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:stream_executor",
         "//third_party/eigen3",
-        "@farmhash_archive//:farmhash",
     ],
 )
 
@@ -5341,7 +5340,6 @@ tf_kernel_library(
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//third_party/eigen3",
-        "@farmhash_archive//:farmhash",
     ],
     alwayslink = 1,
 )
